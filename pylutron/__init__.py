@@ -8,7 +8,7 @@ __author__ = "Dima Zavin"
 __copyright__ = "Copyright 2016, Dima Zavin"
 
 from datetime import timedelta
-from enum import Enum
+from enum import Enum, auto
 import logging
 import socket
 import threading
@@ -299,7 +299,7 @@ class LutronXmlDbParser(object):
             'MAIN_REPEATER',
             'HOMEOWNER_KEYPAD',
             'PALLADIOM_KEYPAD',
-            'HWI_SLIM’,
+            'HWI_SLIM',
             'GRAFIK_T_HYBRID_KEYPAD'):
           keypad = self._parse_keypad(device_xml, device_group)
           area.add_keypad(keypad)
@@ -314,15 +314,20 @@ class LutronXmlDbParser(object):
     lights/outlets, etc."""
     output_type = output_xml.get('OutputType')
     kwargs = {
-      'name': output_xml.get('Name'),
-      'watts': int(output_xml.get('Wattage')),
-      'output_type': output_type,
-      'integration_id': int(output_xml.get('IntegrationID')),
-      'uuid': output_xml.get('UUID')
+        'name': output_xml.get('Name'),
+        'watts': int(output_xml.get('Wattage')),
+        'output_type': output_type,
+        'integration_id': int(output_xml.get('IntegrationID')),
+        'uuid': output_xml.get('UUID')
     }
+    
+    # Create appropriate object based on type
     if output_type == 'SYSTEM_SHADE':
-      return Shade(self._lutron, **kwargs)
-    return Output(self._lutron, **kwargs)
+        return Shade(self._lutron, **kwargs)
+    elif output_type == 'HVAC':
+        return Thermostat(self._lutron, **kwargs)
+    else:
+        return Output(self._lutron, **kwargs)
 
   def _parse_keypad(self, keypad_xml, device_group):
     """Parses a keypad device (the Visor receiver is technically a keypad too)."""
@@ -1301,6 +1306,7 @@ class Area(object):
     self._outputs = []
     self._keypads = []
     self._sensors = []
+    self._thermostats = []
     if occupancy_group:
       occupancy_group._bind_area(self)
 
@@ -1308,6 +1314,9 @@ class Area(object):
     """Adds an output object that's part of this area, only used during
     initial parsing."""
     self._outputs.append(output)
+    # If this is a thermostat (HVAC output), also add it to thermostats list
+    if isinstance(output, Thermostat):
+      self._thermostats.append(output)
 
   def add_keypad(self, keypad):
     """Adds a keypad object that's part of this area, only used during
@@ -1318,6 +1327,10 @@ class Area(object):
     """Adds a motion sensor object that's part of this area, only used during
     initial parsing."""
     self._sensors.append(sensor)
+
+  def add_thermostat(self, thermostat):
+    """Adds a thermostat object that's part of this area."""
+    self._thermostats.append(thermostat)
 
   @property
   def name(self):
@@ -1348,3 +1361,460 @@ class Area(object):
   def sensors(self):
     """Return the tuple of the MotionSensors from this area."""
     return tuple(sensor for sensor in self._sensors)
+
+  @property
+  def thermostats(self):
+    """Return the tuple of Thermostats from this area."""
+    return tuple(thermostat for thermostat in self._thermostats)
+
+class ThermostatMode(Enum):
+    """Operating modes for a Lutron thermostat."""
+    OFF = 1          # Off/Protect
+    HEAT = 2
+    COOL = 3
+    AUTO = 4
+    EMERGENCY_HEAT = 5  # Emergency Heat/Auxiliary Only
+    LOCKED_OUT = 6      # RCS HVAC controller locked out
+    FAN = 7
+    DRY = 8
+
+class ThermostatFanMode(Enum):
+    """Fan modes for a Lutron thermostat."""
+    AUTO = 1
+    ON = 2
+    CYCLER = 3
+    NO_FAN = 4
+    HIGH = 5
+    MEDIUM = 6
+    LOW = 7
+    TOP = 8
+
+class ThermostatCallStatus(Enum):
+    """HVAC call status values."""
+    NONE_LAST_HEAT = 0
+    HEAT_STAGE_1 = 1
+    HEAT_STAGE_1_2 = 2
+    # Add other call status values as needed
+
+class ThermostatSensorStatus(Enum):
+    """Temperature sensor connection status values."""
+    ALL_ACTIVE = 1
+    MISSING_SENSOR = 2
+    WIRED_ONLY = 3
+    NO_SENSOR = 4
+
+class ThermostatScheduleMode(Enum):
+    """Schedule modes for a Lutron thermostat."""
+    UNAVAILABLE = 0  # Schedule not programmed or device needs date/time
+    FOLLOWING = 1    # Running programmed schedule
+    PERMANENT_HOLD = 2  # Schedule not running
+    TEMPORARY_HOLD = 3  # Running schedule, returns to schedule at next event
+
+class ThermostatSystemMode(Enum):
+    """System modes for a Lutron thermostat."""
+    NORMAL = 1
+    AWAY = 2
+    EMERGENCY = 3
+
+class Thermostat(LutronEntity):
+    """Object representing a Lutron thermostat."""
+    _CMD_TYPE = 'HVAC'
+    
+    class Event(LutronEvent):
+        """Thermostat events that can be generated."""
+        TEMPERATURE_CHANGED = auto()
+        SETPOINTS_CHANGED = auto()
+        MODE_CHANGED = auto()
+        FANMODE_CHANGED = auto()
+        ECO_MODE_CHANGED = auto()
+        SCHEDULE_MODE_CHANGED = auto()
+        SYSTEM_MODE_CHANGED = auto()
+        SENSOR_STATUS_CHANGED = auto()
+        CALL_STATUS_CHANGED = auto()
+    
+    # Define action codes for different thermostat commands
+    _ACTION_TEMP_F = 1             # Temperature in Fahrenheit
+    _ACTION_SETPOINTS_F = 2        # Heat and Cool setpoints in Fahrenheit
+    _ACTION_MODE = 3               # Operating mode
+    _ACTION_FANMODE = 4            # Fan mode
+    _ACTION_ECO_MODE = 5           # Eco (Setback) mode
+    _ACTION_ECO_OFFSET = 6         # Eco offset (read-only)
+    _ACTION_SCHEDULE_STATUS = 7     # Schedule status
+    _ACTION_SENSOR_STATUS = 8       # Temperature sensor connection status
+    _ACTION_SCHEDULE_EVENT = 9      # Schedule event details
+    _ACTION_SCHEDULE_DAY = 10       # Schedule day assignment
+    _ACTION_SYSTEM_MODE = 11        # System mode
+    _ACTION_SETPOINTS_NO_ECO_F = 12 # Setpoints without eco offset in Fahrenheit
+    _ACTION_EMERGENCY_AVAIL = 13    # Emergency heat availability
+    _ACTION_CALL_STATUS = 14        # HVAC call status
+    _ACTION_TEMP_C = 15            # Temperature in Celsius
+    _ACTION_SETPOINTS_C = 16       # Heat and Cool setpoints in Celsius
+    _ACTION_SETPOINTS_NO_ECO_C = 17 # Setpoints without eco offset in Celsius
+
+    def __init__(self, lutron, **kwargs):
+        """Initialize the thermostat object.
+        
+        Args:
+            lutron: The main Lutron controller object
+            **kwargs: Keyword arguments including:
+                name: Name of the thermostat
+                integration_id: Integration ID from the Lutron system
+                uuid: UUID from the Lutron system
+                use_celsius: Whether to use Celsius commands (True) or Fahrenheit (False)
+        """
+        super(Thermostat, self).__init__(lutron, kwargs['name'], kwargs['uuid'])
+        self._integration_id = kwargs['integration_id']
+        self._use_celsius = kwargs.get('use_celsius', False)
+        
+        # Temperature and setpoint actions depend on temperature scale
+        self._temp_action = self._ACTION_TEMP_C if self._use_celsius else self._ACTION_TEMP_F
+        self._setpoints_action = self._ACTION_SETPOINTS_C if self._use_celsius else self._ACTION_SETPOINTS_F
+        self._setpoints_no_eco_action = self._ACTION_SETPOINTS_NO_ECO_C if self._use_celsius else self._ACTION_SETPOINTS_NO_ECO_F
+        
+        # Initialize state variables
+        self._temperature = None
+        self._heat_setpoint = None
+        self._cool_setpoint = None
+        self._mode = None
+        self._fan_mode = None
+        self._eco_mode = None
+        self._eco_offset = None
+        self._schedule_mode = None
+        self._system_mode = None
+        self._call_status = None
+        self._emergency_heat_available = None
+        
+        # Create query waiters for each value we can request
+        self._temperature_query = _RequestHelper()
+        self._setpoints_query = _RequestHelper()
+        self._mode_query = _RequestHelper()
+        self._fan_mode_query = _RequestHelper()
+        self._eco_mode_query = _RequestHelper()
+        self._eco_offset_query = _RequestHelper()
+        self._schedule_mode_query = _RequestHelper()
+        self._system_mode_query = _RequestHelper()
+        self._call_status_query = _RequestHelper()
+        self._emergency_heat_query = _RequestHelper()
+        
+        self._lutron.register_id(Thermostat._CMD_TYPE, self)
+
+    @property
+    def id(self):
+        """The integration id"""
+        return self._integration_id
+
+    @property
+    def legacy_uuid(self):
+        """Legacy uuid property"""
+        return str(self.id)
+
+    # Basic properties
+    @property
+    def temperature(self):
+        """Get the current temperature."""
+        if self._temperature is None:
+            ev = self._temperature_query.request(self._query_temperature)
+            ev.wait(1.0)
+        return self._temperature
+
+    @property
+    def mode(self):
+        """Get the current operating mode."""
+        if self._mode is None:
+            ev = self._mode_query.request(self._query_mode)
+            ev.wait(1.0)
+        return self._mode
+
+    @property
+    def fan_mode(self):
+        """Get the current fan mode."""
+        if self._fan_mode is None:
+            ev = self._fan_mode_query.request(self._query_fan_mode)
+            ev.wait(1.0)
+        return self._fan_mode
+
+    # Add these properties after the other basic properties
+    @property
+    def heat_setpoint(self):
+        """Get the current heat setpoint."""
+        if self._heat_setpoint is None:
+            ev = self._setpoints_query.request(self._query_setpoints)
+            ev.wait(1.0)
+        return self._heat_setpoint
+
+    @property
+    def cool_setpoint(self):
+        """Get the current cool setpoint."""
+        if self._cool_setpoint is None:
+            ev = self._setpoints_query.request(self._query_setpoints)
+            ev.wait(1.0)
+        return self._cool_setpoint
+
+    # Setters
+    def set_mode(self, mode):
+        """Set the operating mode."""
+        if not isinstance(mode, ThermostatMode):
+            raise ValueError("Mode must be a ThermostatMode enum value")
+        self._lutron.send(Lutron.OP_EXECUTE, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_MODE,
+                         mode.value)
+        self._mode = mode
+
+    def set_fan_mode(self, mode):
+        """Set the fan mode."""
+        if not isinstance(mode, ThermostatFanMode):
+            raise ValueError("Mode must be a ThermostatFanMode enum value")
+        self._lutron.send(Lutron.OP_EXECUTE, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_FANMODE,
+                         mode.value)
+        self._fan_mode = mode
+
+    def set_setpoints(self, heat_setpoint=None, cool_setpoint=None):
+        """Set heat and/or cool setpoints.
+        
+        Args:
+            heat_setpoint: New heat setpoint, or None to leave unchanged
+            cool_setpoint: New cool setpoint, or None to leave unchanged
+            
+        Note: Setting either setpoint will turn off eco mode if it's enabled.
+        """
+        heat_val = "%.1f" % heat_setpoint if heat_setpoint is not None else "255"
+        cool_val = "%.1f" % cool_setpoint if cool_setpoint is not None else "255"
+        
+        self._lutron.send(Lutron.OP_EXECUTE, Thermostat._CMD_TYPE,
+                         self._integration_id, self._setpoints_action,
+                         heat_val, cool_val)
+        
+        if heat_setpoint is not None:
+            self._heat_setpoint = heat_setpoint
+        if cool_setpoint is not None:
+            self._cool_setpoint = cool_setpoint
+
+    # Query methods
+    def _query_temperature(self):
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._temp_action)
+
+    def _query_mode(self):
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_MODE)
+
+    def _query_fan_mode(self):
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_FANMODE)
+
+    def handle_update(self, args):
+        """Handle status updates from the thermostat."""
+        if len(args) < 2:
+            return False
+            
+        try:
+            action = int(args[0])
+            
+            # Temperature and setpoint updates
+            if action in (self._ACTION_TEMP_F, self._ACTION_TEMP_C):
+                value = self._parse_temp(args[1])
+                self._temperature = value
+                self._temperature_query.notify()
+                self._dispatch_event(Thermostat.Event.TEMPERATURE_CHANGED, 
+                                   {'temperature': value})
+                
+            elif action in (self._ACTION_SETPOINTS_F, self._ACTION_SETPOINTS_C,
+                          self._ACTION_SETPOINTS_NO_ECO_F, self._ACTION_SETPOINTS_NO_ECO_C):
+                if len(args) < 3:
+                    return False
+                heat = self._parse_temp(args[1])
+                cool = self._parse_temp(args[2])
+                self._heat_setpoint = heat
+                self._cool_setpoint = cool
+                self._setpoints_query.notify()
+                self._dispatch_event(Thermostat.Event.SETPOINTS_CHANGED,
+                                   {'heat': heat, 'cool': cool})
+                
+            elif action == self._ACTION_MODE:
+                self._mode = ThermostatMode(int(args[1]))
+                self._mode_query.notify()
+                self._dispatch_event(Thermostat.Event.MODE_CHANGED,
+                                   {'mode': self._mode})
+                
+            elif action == self._ACTION_FANMODE:
+                self._fan_mode = ThermostatFanMode(int(args[1]))
+                self._fan_mode_query.notify()
+                self._dispatch_event(Thermostat.Event.FANMODE_CHANGED,
+                                   {'mode': self._fan_mode})
+                
+            elif action == self._ACTION_ECO_MODE:
+                self._eco_mode = int(args[1]) == 2  # 1=Off, 2=On
+                self._eco_mode_query.notify()
+                self._dispatch_event(Thermostat.Event.ECO_MODE_CHANGED,
+                                   {'enabled': self._eco_mode})
+                
+            elif action == self._ACTION_ECO_OFFSET:
+                self._eco_offset = float(args[1])
+                self._eco_offset_query.notify()
+                
+            elif action == self._ACTION_SCHEDULE_STATUS:
+                self._schedule_mode = ThermostatScheduleMode(int(args[1]))
+                self._schedule_mode_query.notify()
+                self._dispatch_event(Thermostat.Event.SCHEDULE_MODE_CHANGED,
+                                   {'mode': self._schedule_mode})
+                
+            elif action == self._ACTION_SENSOR_STATUS:
+                self._sensor_status = ThermostatSensorStatus(int(args[1]))
+                self._sensor_status_query.notify()
+                self._dispatch_event(Thermostat.Event.SENSOR_STATUS_CHANGED,
+                                   {'status': self._sensor_status})
+                
+            elif action == self._ACTION_SYSTEM_MODE:
+                self._system_mode = ThermostatSystemMode(int(args[1]))
+                self._system_mode_query.notify()
+                self._dispatch_event(Thermostat.Event.SYSTEM_MODE_CHANGED,
+                                   {'mode': self._system_mode})
+                
+            elif action == self._ACTION_CALL_STATUS:
+                self._call_status = ThermostatCallStatus(int(args[1]))
+                self._call_status_query.notify()
+                self._dispatch_event(Thermostat.Event.CALL_STATUS_CHANGED,
+                                   {'status': self._call_status})
+                
+            elif action == self._ACTION_EMERGENCY_AVAIL:
+                self._emergency_heat_available = int(args[1]) == 1
+                self._emergency_heat_query.notify()
+                
+            else:
+                return False
+                
+            return True
+            
+        except (ValueError, IndexError):
+            _LOGGER.warning(f"Invalid thermostat update: {args}")
+            return False
+
+    def _parse_temp(self, temp_str):
+        """Parse temperature values that may be zero-padded with varying decimal places."""
+        # Strip any leading zeros while preserving decimal point
+        temp_str = temp_str.lstrip('0')
+        if temp_str.startswith('.'):
+            temp_str = '0' + temp_str
+        return float(temp_str)
+
+    # Query helper methods
+    def _query_eco_mode(self):
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_ECO_MODE)
+
+    def _query_eco_offset(self):
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_ECO_OFFSET)
+
+    def _query_schedule_mode(self):
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_SCHEDULE_STATUS)
+
+    def _query_sensor_status(self):
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_SENSOR_STATUS)
+
+    def _query_system_mode(self):
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_SYSTEM_MODE)
+
+    def _query_call_status(self):
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_CALL_STATUS)
+
+    def _query_emergency_heat_available(self):
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_EMERGENCY_AVAIL)
+
+    # Properties for the new features
+    @property
+    def sensor_status(self):
+        """Get the temperature sensor connection status."""
+        if self._sensor_status is None:
+            ev = self._sensor_status_query.request(self._query_sensor_status)
+            ev.wait(1.0)
+        return self._sensor_status
+
+    @property
+    def call_status(self):
+        """Get the current HVAC call status."""
+        if self._call_status is None:
+            ev = self._call_status_query.request(self._query_call_status)
+            ev.wait(1.0)
+        return self._call_status
+
+    @property
+    def emergency_heat_available(self):
+        """Check if emergency heat is available."""
+        if self._emergency_heat_available is None:
+            ev = self._emergency_heat_query.request(self._query_emergency_heat_available)
+            ev.wait(1.0)
+        return self._emergency_heat_available
+
+    def get_schedule_event(self, schedule_num, event_num):
+        """Get details for a specific schedule event.
+        
+        Args:
+            schedule_num: Schedule number (1-7)
+            event_num: Event number (1-4)
+        
+        Returns:
+            Dict with event details (time, heat setpoint, cool setpoint)
+        """
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_SCHEDULE_EVENT,
+                         schedule_num, event_num)
+        # Note: Response handling would need to be implemented in handle_update
+
+    def get_schedule_days(self, schedule_num):
+        """Get the days assigned to a specific schedule.
+        
+        Args:
+            schedule_num: Schedule number (1-7)
+            
+        Returns:
+            List of days (0=Sunday through 6=Saturday) when this schedule is active
+        """
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._ACTION_SCHEDULE_DAY,
+                         schedule_num)
+        # Note: Response handling would need to be implemented in handle_update
+
+    # And add this query method with the other query methods
+    def _query_setpoints(self):
+        """Query both heat and cool setpoints."""
+        self._lutron.send(Lutron.OP_QUERY, Thermostat._CMD_TYPE,
+                         self._integration_id, self._setpoints_action)
+
+    @property
+    def eco_mode(self):
+        """Get the current eco mode status."""
+        if self._eco_mode is None:
+            ev = self._eco_mode_query.request(self._query_eco_mode)
+            ev.wait(1.0)
+        return self._eco_mode
+
+    @property
+    def eco_offset(self):
+        """Get the current eco offset value."""
+        if self._eco_offset is None:
+            ev = self._eco_offset_query.request(self._query_eco_offset)
+            ev.wait(1.0)
+        return self._eco_offset
+
+    @property
+    def schedule_mode(self):
+        """Get the current schedule mode."""
+        if self._schedule_mode is None:
+            ev = self._schedule_mode_query.request(self._query_schedule_mode)
+            ev.wait(1.0)
+        return self._schedule_mode
+
+    @property
+    def system_mode(self):
+        """Get the current system mode."""
+        if self._system_mode is None:
+            ev = self._system_mode_query.request(self._query_system_mode)
+            ev.wait(1.0)
+        return self._system_mode
