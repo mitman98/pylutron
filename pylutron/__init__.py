@@ -1818,3 +1818,22 @@ class Thermostat(LutronEntity):
             ev = self._system_mode_query.request(self._query_system_mode)
             ev.wait(1.0)
         return self._system_mode
+
+__all__ = [
+    'Lutron',
+    'Button',
+    'Output',
+    'Shade',
+    'Thermostat',
+    'ThermostatMode',
+    'ThermostatFanMode',
+    'ThermostatScheduleMode',
+    'ThermostatSystemMode',
+    'ThermostatCallStatus',
+    'ThermostatSensorStatus',
+    'Area',
+    'Keypad',
+    'Led',
+    'MotionSensor',
+    'OccupancyGroup'
+]
